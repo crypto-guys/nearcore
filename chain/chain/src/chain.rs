@@ -919,15 +919,11 @@ impl Chain {
         chain_store_update.commit()?;
 
         // clear all trie data
-        let keys: Vec<Vec<u8>> =
-            self.store().store().iter_prefix(ColState, &[]).map(|kv| kv.0.into()).collect();
+
         let tries = self.runtime_adapter.get_tries();
         let mut chain_store_update = self.mut_store().store_update();
         let mut store_update = StoreUpdate::new_with_tries(tries);
-        for key in keys.iter() {
-            store_update.delete(ColState, key.as_ref());
-            chain_store_update.inc_gc_col_state();
-        }
+        store_update.delete_all(ColState);
         chain_store_update.merge(store_update);
 
         // The reason to reset tail here is not to allow Tail be greater than Head
@@ -1741,14 +1737,17 @@ impl Chain {
         let shard_state_header = self.get_state_header(shard_id, sync_hash)?;
         let mut height = shard_state_header.chunk_height_included();
         let state_root = shard_state_header.chunk_prev_state_root();
-        let mut parts = vec![];
         for part_id in 0..num_parts {
             let key = StatePartKey(sync_hash, shard_id, part_id).try_to_vec()?;
-            parts.push(self.store.owned_store().get(ColStateParts, &key)?.unwrap());
+            let part = self.store.owned_store().get(ColStateParts, &key)?.unwrap();
+            self.runtime_adapter.apply_state_part(
+                shard_id,
+                &state_root,
+                part_id,
+                num_parts,
+                &part,
+            )?;
         }
-
-        // Confirm that state matches the parts we received
-        self.runtime_adapter.confirm_state(shard_id, &state_root, &parts)?;
 
         // Applying the chunk starts here
         let mut chain_update = self.chain_update();
@@ -1879,12 +1878,33 @@ impl Chain {
     fn get_recursive_transaction_results(
         &mut self,
         id: &CryptoHash,
+        allow_error: bool,
     ) -> Result<Vec<ExecutionOutcomeWithIdView>, Error> {
-        let outcome: ExecutionOutcomeWithIdView = self.get_execution_outcome(id)?.into();
+        let outcome: ExecutionOutcomeWithIdView = match self.get_execution_outcome(id) {
+            Ok(res) => res.into(),
+            Err(e) => match e.kind() {
+                ErrorKind::DBNotFoundErr(_) if allow_error => return Ok(vec![]),
+                _ => return Err(e),
+            },
+        };
         let receipt_ids = outcome.outcome.receipt_ids.clone();
+        let shard_id = self.runtime_adapter.account_id_to_shard_id(&outcome.outcome.executor_id);
+        let congested = {
+            let block = self.get_block(&outcome.block_hash)?;
+            let chunk_included =
+                block.chunks()[shard_id as usize].height_included() == block.header().height();
+            if !chunk_included {
+                let block_hash = *block.hash();
+                let chunk_extra = self.get_chunk_extra(&block_hash, shard_id)?;
+                chunk_extra.gas_used >= chunk_extra.gas_limit
+            } else {
+                false
+            }
+        };
         let mut results = vec![outcome];
+
         for receipt_id in &receipt_ids {
-            results.extend(self.get_recursive_transaction_results(receipt_id)?);
+            results.extend(self.get_recursive_transaction_results(receipt_id, congested)?);
         }
         Ok(results)
     }
@@ -1893,7 +1913,7 @@ impl Chain {
         &mut self,
         transaction_hash: &CryptoHash,
     ) -> Result<FinalExecutionOutcomeView, Error> {
-        let mut outcomes = self.get_recursive_transaction_results(transaction_hash)?;
+        let mut outcomes = self.get_recursive_transaction_results(transaction_hash, false)?;
         let mut looking_for_id = (*transaction_hash).into();
         let num_outcomes = outcomes.len();
         let status = outcomes
@@ -1920,7 +1940,8 @@ impl Chain {
                     None
                 }
             })
-            .expect("results should resolve to a final outcome");
+            .unwrap_or(FinalExecutionStatus::Started); // XXX: Temporary fix to avoid panic
+                                                       //.expect("results should resolve to a final outcome");
         let receipts_outcome = outcomes.split_off(1);
         let transaction: SignedTransactionView = self
             .store
@@ -2682,6 +2703,7 @@ impl<'a> ChainUpdate<'a> {
                 &challenges_result,
                 *block.header().random_value(),
                 true,
+                true,
             )
             .unwrap();
         let partial_state = apply_result.proof.unwrap().nodes;
@@ -2812,6 +2834,7 @@ impl<'a> ChainUpdate<'a> {
                             gas_limit,
                             &block.header().challenges_result(),
                             *block.header().random_value(),
+                            true,
                         )
                         .map_err(|e| ErrorKind::Other(e.to_string()))?;
 
@@ -2866,6 +2889,7 @@ impl<'a> ChainUpdate<'a> {
                             new_extra.gas_limit,
                             &block.header().challenges_result(),
                             *block.header().random_value(),
+                            false,
                         )
                         .map_err(|e| ErrorKind::Other(e.to_string()))?;
 
@@ -2873,6 +2897,19 @@ impl<'a> ChainUpdate<'a> {
                     new_extra.state_root = apply_result.new_root;
 
                     self.chain_store_update.save_chunk_extra(&block.hash(), shard_id, new_extra);
+
+                    if !apply_result.outcomes.is_empty() {
+                        // debug_assert!(false);
+                        // Remove in next release
+                        let (_, outcome_paths) =
+                            ApplyTransactionResult::compute_outcomes_proof(&apply_result.outcomes);
+                        self.chain_store_update.save_outcomes_with_proofs(
+                            &block.hash(),
+                            shard_id,
+                            apply_result.outcomes,
+                            outcome_paths,
+                        );
+                    }
                 }
             }
         }
@@ -3545,6 +3582,7 @@ impl<'a> ChainUpdate<'a> {
             gas_limit,
             &block_header.challenges_result(),
             *block_header.random_value(),
+            true,
         )?;
 
         let (outcome_root, outcome_proofs) =
@@ -3623,6 +3661,7 @@ impl<'a> ChainUpdate<'a> {
             chunk_extra.gas_limit,
             &block_header.challenges_result(),
             *block_header.random_value(),
+            false,
         )?;
 
         self.chain_store_update.save_trie_changes(apply_result.trie_changes);

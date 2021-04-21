@@ -26,6 +26,9 @@ use crate::ApplyState;
 pub struct TrieViewer {}
 
 impl TrieViewer {
+    /// Upper bound of the size of contract state that is still viewable.
+    const CONTRACT_STATE_SIZE_LIMIT: u64 = 50_000;
+
     pub fn new() -> Self {
         Self {}
     }
@@ -77,6 +80,19 @@ impl TrieViewer {
         if !is_valid_account_id(account_id) {
             return Err(format!("Account ID '{}' is not valid", account_id).into());
         }
+        match get_account(state_update, account_id)? {
+            Some(account) => {
+                let code_len = get_code(state_update, account_id, Some(account.code_hash))?
+                    .map(|c| c.code.len() as u64)
+                    .unwrap_or_default();
+                if account.storage_usage > Self::CONTRACT_STATE_SIZE_LIMIT + code_len {
+                    return Err(format!("The state of account {} is too large", account_id).into());
+                }
+            }
+            None => {
+                return Err(format!("account {} does not exist", account_id).into());
+            }
+        };
         let mut values = vec![];
         let query = trie_key_parsers::get_raw_prefix_for_contract_data(account_id, prefix);
         let acc_sep_len = query.len() - prefix.len();
@@ -146,6 +162,7 @@ impl TrieViewer {
             current_protocol_version: view_state.current_protocol_version,
             config: config.clone(),
             cache: view_state.cache,
+            is_new_chunk: false,
             #[cfg(feature = "protocol_feature_evm")]
             evm_chain_id: view_state.evm_chain_id,
             #[cfg(feature = "costs_counting")]
@@ -192,7 +209,7 @@ impl TrieViewer {
             Err(message.into())
         } else {
             let outcome = outcome.unwrap();
-            debug!(target: "runtime", "(exec time {}) result of execution: {:#?}", time_str, outcome);
+            // debug!(target: "runtime", "(exec time {}) result of execution: {:#?}", time_str, outcome);
             logs.extend(outcome.logs);
             let mut result = vec![];
             if let ReturnData::Value(buf) = &outcome.return_data {
